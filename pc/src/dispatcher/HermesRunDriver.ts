@@ -46,9 +46,10 @@ export class HermesRunDriver {
     onEvent: (event: HermesRunDriverEvent) => void
   ): Promise<HermesRunDriverResult> {
     let latestOutput = "";
+    const visibleFilter = new VisibleXmlStreamFilter();
     await this.withTimeout(
       this.api.streamRunEvents(active.runId, (event) => {
-        latestOutput = this.handleEvent(event, latestOutput, onEvent);
+        latestOutput = this.handleEvent(event, latestOutput, visibleFilter, onEvent);
       }, active.controller.signal),
       this.runTimeoutMs
     );
@@ -61,7 +62,7 @@ export class HermesRunDriver {
     return {
       active,
       status,
-      finalText: outputText(status.output) ?? latestOutput
+      finalText: sanitizeVisibleXml(outputText(status.output) ?? latestOutput)
     };
   }
 
@@ -83,6 +84,7 @@ export class HermesRunDriver {
   private handleEvent(
     event: HermesSseEvent,
     latestOutput: string,
+    visibleFilter: VisibleXmlStreamFilter,
     onEvent: (event: HermesRunDriverEvent) => void
   ): string {
     const toolName = eventToolName(event);
@@ -97,8 +99,12 @@ export class HermesRunDriver {
     if (!delta) {
       return latestOutput;
     }
-    const accumulated = latestOutput + delta;
-    onEvent({ type: "delta", delta, accumulated, raw: event });
+    const visibleDelta = visibleFilter.push(delta);
+    if (!visibleDelta) {
+      return latestOutput;
+    }
+    const accumulated = latestOutput + visibleDelta;
+    onEvent({ type: "delta", delta: visibleDelta, accumulated, raw: event });
     return accumulated;
   }
 
@@ -116,6 +122,87 @@ export class HermesRunDriver {
         clearTimeout(timer);
       }
     }
+  }
+}
+
+const XML_BLOCK_TAGS = [
+  "think",
+  "thinking",
+  "reasoning",
+  "thought",
+  "reasoning_scratchpad",
+  "tool_call",
+  "tool_calls",
+  "tool_result",
+  "function_call",
+  "function_calls",
+  "invoke",
+  "invoke_tool"
+];
+
+const XML_BLOCK_TAG_PATTERN = XML_BLOCK_TAGS.join("|");
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function startsProtectedXmlTag(fragment: string): boolean {
+  const lower = fragment.toLowerCase();
+  return XML_BLOCK_TAGS.some((tag) => `<${tag}`.startsWith(lower) || lower.startsWith(`<${tag}`))
+    || "<function".startsWith(lower)
+    || lower.startsWith("<function");
+}
+
+function sanitizeVisibleXml(text: string): string {
+  if (!text) {
+    return "";
+  }
+  let result = text;
+  for (const tag of XML_BLOCK_TAGS) {
+    const escaped = escapeRegExp(tag);
+    result = result.replace(new RegExp(`<${escaped}\\b[^>]*>[\\s\\S]*?<\\/${escaped}>`, "gi"), "");
+  }
+  result = result.replace(
+    /(^|[\n\r.!?:])([ \t]*)<function\b[^>]*\bname\s*=[^>]*>[\s\S]*?<\/function>/gi,
+    "$1"
+  );
+  result = result.replace(
+    new RegExp(`<(?:${XML_BLOCK_TAG_PATTERN})\\b[^>]*>[\\s\\S]*$`, "i"),
+    ""
+  );
+  result = result.replace(
+    /(^|[\n\r.!?:])([ \t]*)<function\b[^>]*\bname\s*=[^>]*>[\s\S]*$/i,
+    "$1"
+  );
+  result = result.replace(new RegExp(`<\\/(?:${XML_BLOCK_TAG_PATTERN}|function)>\\s*`, "gi"), "");
+  return result;
+}
+
+export class VisibleXmlStreamFilter {
+  private raw = "";
+  private emitted = "";
+
+  push(delta: string): string {
+    this.raw += delta;
+    let visible = sanitizeVisibleXml(this.raw);
+
+    // Hold back a partial protected tag at the tail so the UI does not briefly
+    // render fragments like "<invoke" before the closing ">" arrives.
+    const lastLt = visible.lastIndexOf("<");
+    if (lastLt >= 0) {
+      const tail = visible.slice(lastLt);
+      if (!tail.includes(">") && startsProtectedXmlTag(tail)) {
+        visible = visible.slice(0, lastLt);
+      }
+    }
+
+    if (visible.length < this.emitted.length) {
+      this.emitted = visible;
+      return "";
+    }
+    const next = visible.slice(this.emitted.length);
+    this.emitted = visible;
+    return next;
   }
 }
 
@@ -172,15 +259,108 @@ function eventToolName(event: HermesSseEvent): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
-function eventDelta(event: HermesSseEvent): string | undefined {
+const VISIBLE_DELTA_EVENT_NAMES = new Set([
+  "assistant.delta",
+  "message.delta",
+  "response.output_text.delta"
+]);
+
+function eventNames(event: HermesSseEvent): string[] {
+  const record = asRecord(event.data);
+  const nested = asRecord(record?.data);
+  return [
+    event.event,
+    typeof record?.event === "string" ? record.event : undefined,
+    typeof record?.type === "string" ? record.type : undefined,
+    typeof nested?.event === "string" ? nested.event : undefined,
+    typeof nested?.type === "string" ? nested.type : undefined
+  ]
+    .filter((value): value is string => Boolean(value && value.trim()))
+    .map((value) => value.trim().toLowerCase());
+}
+
+function isVisibleDeltaEvent(event: HermesSseEvent): boolean {
+  const names = eventNames(event);
+  return names.some((name) => VISIBLE_DELTA_EVENT_NAMES.has(name));
+}
+
+// Size cap: legitimate assistant text deltas are tiny. Anything past this is
+// almost certainly a tool-result payload (e.g. phone_observe screen dumps)
+// riding the delta channel.
+export const MAX_VISIBLE_DELTA_CHARS = 2048;
+
+// Heuristic shape match for JSON-encoded tool outputs that masquerade as a
+// text delta. Phone MCP observations, tool_use blocks, and most structured
+// payloads all carry one of these markers.
+const TOOL_PAYLOAD_KEYS = [
+  "tool_call_id",
+  "tool_use_id",
+  "tool_calls",
+  "tool_result",
+  "function_call",
+  "is_error",
+  "content_description",
+  "contentDescription",
+  "nodes",
+  "bounds",
+  "accessibility_tree"
+] as const;
+
+export function looksLikeToolPayload(value: string): boolean {
+  if (!value) {
+    return false;
+  }
+  const trimmed = value.trimStart();
+  if (trimmed.length === 0 || trimmed[0] !== "{") {
+    return false;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return false;
+  }
+  if (!parsed || typeof parsed !== "object") {
+    return false;
+  }
+  const record = parsed as Record<string, unknown>;
+  // Distinctive keys: any one of these is enough.
+  if (TOOL_PAYLOAD_KEYS.some((key) => key in record)) {
+    return true;
+  }
+  // `name` alone is too generic, but `name` together with structured content
+  // (object/array `content`, `input`, or `arguments`) is a tool-call shape.
+  if (typeof record.name === "string" && record.name.length > 0) {
+    if (
+      record.content !== undefined && (typeof record.content === "object") ||
+      record.input !== undefined ||
+      record.arguments !== undefined
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function eventDelta(event: HermesSseEvent): string | undefined {
+  if (!isVisibleDeltaEvent(event)) {
+    return undefined;
+  }
   const record = asRecord(event.data);
   const nested = asRecord(record?.data) ?? record;
   for (const source of [nested, record]) {
     for (const key of ["delta", "text_delta", "output_text", "text"]) {
       const value = source?.[key];
-      if (typeof value === "string" && value.length > 0) {
-        return value;
+      if (typeof value !== "string" || value.length === 0) {
+        continue;
       }
+      if (value.length > MAX_VISIBLE_DELTA_CHARS) {
+        return undefined;
+      }
+      if (looksLikeToolPayload(value)) {
+        return undefined;
+      }
+      return value;
     }
   }
   return undefined;
