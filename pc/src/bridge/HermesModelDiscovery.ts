@@ -37,10 +37,7 @@ const FALLBACK_PROVIDER_MODELS: Record<string, string[]> = {
     "gpt-5.1-codex-mini"
   ],
   minimax: [
-    "MiniMax-M2.7",
-    "MiniMax-M2.5",
-    "MiniMax-M2.1",
-    "MiniMax-M2"
+    "MiniMax-M3"
   ]
 };
 
@@ -79,7 +76,9 @@ export function discoverHermesModels(defaultModel: string): ChatModelOption[] {
   const catalog = loadHermesProviderCatalog(home, [...providerIds]);
   for (const provider of providerIds) {
     const configured = config.providers.get(provider)?.models ?? [];
-    const catalogModels = catalog.get(provider) ?? FALLBACK_PROVIDER_MODELS[provider] ?? [];
+    const catalogModels = configured.length > 0
+      ? []
+      : catalog.get(provider) ?? FALLBACK_PROVIDER_MODELS[provider] ?? [];
     const ids = uniqueStrings([
       ...configured.map((model) => model.id),
       ...catalogModels
